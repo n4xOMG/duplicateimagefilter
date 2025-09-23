@@ -1,8 +1,6 @@
 import os
-import cv2
 import numpy as np
 from PIL import Image
-import hashlib
 from pathlib import Path
 import argparse
 from collections import defaultdict
@@ -13,24 +11,17 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox, scrolledtext
 from typing import List, Tuple, Dict, Set, Optional
 import gc
+import multiprocessing as mp
 
 class ImageFilter:
-    def __init__(self, similarity_threshold=0.95, solid_color_threshold=0.98, max_workers=8, 
+    def __init__(self, similarity_threshold=0.95, solid_color_threshold=0.98, max_workers=None, 
                  min_resolution=None, max_resolution=None, hash_size=8):
         """
         Initialize the image filter optimized for large datasets.
-        
-        Args:
-            similarity_threshold: Threshold for considering images similar (0-1)
-            solid_color_threshold: Threshold for considering image as solid color (0-1)
-            max_workers: Number of parallel workers for processing
-            min_resolution: Minimum resolution as (width, height) tuple
-            max_resolution: Maximum resolution as (width, height) tuple
-            hash_size: Hash size for similarity detection (8 is optimal for speed/accuracy balance)
         """
         self.similarity_threshold = similarity_threshold
         self.solid_color_threshold = solid_color_threshold
-        self.max_workers = max_workers
+        self.max_workers = max_workers or min(32, (os.cpu_count() or 1) * 2)
         self.min_resolution = min_resolution
         self.max_resolution = max_resolution
         self.hash_size = hash_size
@@ -40,10 +31,10 @@ class ImageFilter:
         self.max_hash_distance = int(self.hash_size * self.hash_size * (1 - self.similarity_threshold))
         self.solid_variance_threshold = 255 * 255 * (1 - self.solid_color_threshold)
     
-    def _get_image_info(self, image_path: Path) -> Tuple[Optional[Tuple[int, int]], bool, Optional[str]]:
+    def _get_image_info_fast(self, image_path: Path) -> Tuple[Optional[Tuple[int, int]], bool, Optional[int]]:
         """
-        Get image resolution, check if solid color, and calculate hash in one pass.
-        Returns: (resolution, is_solid_color, hash)
+        Ultra-fast image processing using integer hash instead of string.
+        Returns: (resolution, is_solid_color, hash_int)
         """
         try:
             with Image.open(image_path) as img:
@@ -54,23 +45,29 @@ class ImageFilter:
                     return resolution, False, None
                 
                 # Convert to grayscale and resize for processing
-                gray_img = img.convert('L').resize((self.hash_size + 1, self.hash_size), Image.Resampling.LANCZOS)
+                gray_img = img.convert('L').resize((self.hash_size + 1, self.hash_size), Image.Resampling.NEAREST)
                 pixels = np.array(gray_img, dtype=np.uint8)
                 
-                # Check if solid color using variance (faster than separate resize)
+                # Check if solid color using variance
                 variance = np.var(pixels)
                 is_solid = variance < self.solid_variance_threshold
                 
                 if is_solid:
                     return resolution, True, None
                 
-                # Calculate difference hash (dHash) - most efficient for duplicates
+                # Calculate difference hash as integer (much faster)
                 diff = pixels[:, 1:] > pixels[:, :-1]
-                hash_str = ''.join(['1' if bit else '0' for bit in diff.flatten()])
+                hash_bits = diff.flatten()
                 
-                return resolution, False, hash_str
+                # Convert to integer hash (faster than string operations)
+                hash_int = 0
+                for i, bit in enumerate(hash_bits):
+                    if bit:
+                        hash_int |= (1 << i)
                 
-        except Exception as e:
+                return resolution, False, hash_int
+                
+        except Exception:
             return None, False, None
     
     def _is_resolution_valid(self, resolution: Tuple[int, int]) -> bool:
@@ -92,73 +89,84 @@ class ImageFilter:
         
         return True
     
-    def _hamming_distance(self, hash1: str, hash2: str) -> int:
-        """Calculate Hamming distance between two hashes efficiently."""
-        return sum(c1 != c2 for c1, c2 in zip(hash1, hash2))
+    def _hamming_distance_int(self, hash1: int, hash2: int) -> int:
+        """Calculate Hamming distance between two integer hashes (much faster)."""
+        return bin(hash1 ^ hash2).count('1')
     
-    def _find_duplicates_efficient(self, hash_data: List[Tuple[str, str]]) -> List[List[str]]:
+    def _find_duplicates_ultra_fast(self, hash_data: List[Tuple[str, int]]) -> List[List[str]]:
         """
-        Find duplicate groups using optimized clustering algorithm.
-        Uses Union-Find for efficient grouping.
+        Ultra-fast duplicate detection using LSH (Locality Sensitive Hashing) approach.
         """
         if not hash_data:
             return []
         
-        # Create hash lookup for exact matches (fastest)
-        exact_matches = defaultdict(list)
-        path_to_hash = {}
+        print(f"Finding duplicates among {len(hash_data):,} valid images...")
+        start_time = time.time()
         
+        # Create hash lookup for exact matches (instant)
+        exact_matches = defaultdict(list)
         for path, hash_val in hash_data:
             exact_matches[hash_val].append(path)
-            path_to_hash[path] = hash_val
         
         duplicate_groups = []
-        processed_paths = set()
+        processed_hashes = set()
         
         # Process exact matches first
         for hash_val, paths in exact_matches.items():
             if len(paths) > 1:
                 duplicate_groups.append(paths)
-                processed_paths.update(paths)
+                processed_hashes.add(hash_val)
+                print(f"Found exact match group: {len(paths)} images")
         
-        # Process remaining for near-matches using efficient clustering
+        # For near-matches, use LSH buckets for O(n) performance
         remaining = [(path, hash_val) for path, hash_val in hash_data 
-                    if path not in processed_paths]
+                    if hash_val not in processed_hashes]
         
         if len(remaining) > 1:
-            # Use Union-Find for efficient clustering
-            parent = {path: path for path, _ in remaining}
+            print(f"Checking {len(remaining):,} images for near-matches...")
             
-            def find(x):
-                if parent[x] != x:
-                    parent[x] = find(parent[x])
-                return parent[x]
+            # Create LSH buckets using hash prefixes
+            bucket_size = max(4, self.hash_size - 2)  # Allow some bit differences
+            buckets = defaultdict(list)
             
-            def union(x, y):
-                px, py = find(x), find(y)
-                if px != py:
-                    parent[px] = py
+            for path, hash_val in remaining:
+                # Create multiple bucket keys by masking different bits
+                for shift in range(0, self.hash_size * self.hash_size, bucket_size):
+                    bucket_key = (hash_val >> shift) & ((1 << bucket_size) - 1)
+                    buckets[bucket_key].append((path, hash_val))
             
-            # Compare hashes and union similar ones
-            for i, (path1, hash1) in enumerate(remaining):
-                for j, (path2, hash2) in enumerate(remaining[i+1:], i+1):
-                    if self._hamming_distance(hash1, hash2) <= self.max_hash_distance:
-                        union(path1, path2)
+            # Check only items in same buckets
+            processed_paths = set()
             
-            # Group by root parent
-            groups = defaultdict(list)
-            for path, _ in remaining:
-                groups[find(path)].append(path)
-            
-            # Add groups with more than one image
-            for group in groups.values():
-                if len(group) > 1:
-                    duplicate_groups.append(group)
+            for bucket_items in buckets.values():
+                if len(bucket_items) < 2:
+                    continue
+                
+                # Quick check within bucket
+                for i, (path1, hash1) in enumerate(bucket_items):
+                    if path1 in processed_paths:
+                        continue
+                    
+                    similar_group = [path1]
+                    processed_paths.add(path1)
+                    
+                    for j, (path2, hash2) in enumerate(bucket_items[i+1:], i+1):
+                        if path2 in processed_paths:
+                            continue
+                        
+                        if self._hamming_distance_int(hash1, hash2) <= self.max_hash_distance:
+                            similar_group.append(path2)
+                            processed_paths.add(path2)
+                    
+                    if len(similar_group) > 1:
+                        duplicate_groups.append(similar_group)
         
+        elapsed = time.time() - start_time
+        print(f"Duplicate detection completed in {elapsed:.1f}s")
         return duplicate_groups
     
-    def _process_batch(self, image_paths: List[Path]) -> Dict[str, List]:
-        """Process a batch of images efficiently."""
+    def _process_batch_ultra_fast(self, image_paths: List[Path]) -> Dict[str, List]:
+        """Process a batch of images with maximum speed."""
         results = {
             'solid_color': [],
             'resolution_filtered': [],
@@ -168,7 +176,7 @@ class ImageFilter:
         
         for path in image_paths:
             try:
-                resolution, is_solid, hash_val = self._get_image_info(path)
+                resolution, is_solid, hash_val = self._get_image_info_fast(path)
                 
                 if resolution is None:
                     results['errors'].append(str(path))
@@ -176,7 +184,7 @@ class ImageFilter:
                     results['resolution_filtered'].append(str(path))
                 elif is_solid:
                     results['solid_color'].append(str(path))
-                elif hash_val:
+                elif hash_val is not None:
                     results['valid_hashes'].append((str(path), hash_val))
                 else:
                     results['errors'].append(str(path))
@@ -186,10 +194,11 @@ class ImageFilter:
         
         return results
     
-    def process_images_optimized(self, image_paths: List[Path], progress_callback=None) -> Dict[str, List]:
-        """Process images with optimized parallel processing and memory management."""
+    def process_images_ultra_fast(self, image_paths: List[Path], progress_callback=None) -> Dict[str, List]:
+        """Process images with maximum parallel efficiency."""
         total_images = len(image_paths)
-        batch_size = min(500, max(50, total_images // self.max_workers))
+        # Optimize batch size for maximum throughput
+        batch_size = min(200, max(20, total_images // (self.max_workers * 4)))
         
         results = {
             'solid_color': [],
@@ -203,71 +212,76 @@ class ImageFilter:
         
         def log_progress():
             nonlocal processed_count
-            if processed_count % 1000 == 0 or processed_count == total_images:
+            if processed_count % 2000 == 0 or processed_count == total_images:
                 elapsed = time.time() - start_time
                 rate = processed_count / elapsed if elapsed > 0 else 0
                 eta = (total_images - processed_count) / rate if rate > 0 else 0
                 
                 message = (f"Processed: {processed_count:,}/{total_images:,} "
                           f"({processed_count/total_images*100:.1f}%) - "
-                          f"Rate: {rate:.1f} img/sec - ETA: {eta:.0f}s")
+                          f"Rate: {rate:.0f} img/sec - ETA: {eta:.0f}s")
                 
                 if progress_callback:
                     progress_callback(message)
                 print(message)
         
-        # Process in batches with parallel execution
-        with concurrent.futures.ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+        # Use ProcessPoolExecutor for CPU-intensive tasks when dataset is large
+        executor_class = concurrent.futures.ProcessPoolExecutor if total_images > 10000 else concurrent.futures.ThreadPoolExecutor
+        
+        with executor_class(max_workers=self.max_workers) as executor:
             # Submit all batches
-            future_to_batch = {}
+            futures = []
             for i in range(0, total_images, batch_size):
                 batch = image_paths[i:i + batch_size]
-                future = executor.submit(self._process_batch, batch)
-                future_to_batch[future] = len(batch)
+                future = executor.submit(self._process_batch_ultra_fast, batch)
+                futures.append((future, len(batch)))
             
             # Collect results as they complete
-            for future in concurrent.futures.as_completed(future_to_batch):
+            for future, batch_len in futures:
                 try:
                     batch_results = future.result()
-                    batch_size = future_to_batch[future]
                     
                     # Merge results
                     for key in results:
                         results[key].extend(batch_results[key])
                     
-                    processed_count += batch_size
+                    processed_count += batch_len
                     log_progress()
                     
-                    # Periodic garbage collection for large datasets
-                    if processed_count % 5000 == 0:
-                        gc.collect()
-                        
                 except Exception as e:
                     print(f"Batch processing error: {e}")
-                    processed_count += future_to_batch[future]
+                    processed_count += batch_len
         
         elapsed = time.time() - start_time
+        rate = total_images / elapsed if elapsed > 0 else 0
         if progress_callback:
-            progress_callback(f"Processing completed in {elapsed:.1f}s - Rate: {total_images/elapsed:.1f} img/sec")
+            progress_callback(f"Processing completed in {elapsed:.1f}s - Rate: {rate:.0f} img/sec")
         
         return results
     
-    def get_image_files(self, folder_path: str) -> List[Path]:
-        """Get all image files from folder with progress indication."""
+    def get_image_files_fast(self, folder_path: str) -> List[Path]:
+        """Get all image files with optimized scanning."""
         folder = Path(folder_path)
         image_files = []
         
         print("Scanning for image files...")
         start_time = time.time()
         
-        # Use iterdir and rglob efficiently
-        for file_path in folder.rglob('*'):
-            if file_path.is_file() and file_path.suffix.lower() in self.supported_formats:
-                image_files.append(file_path)
-                
-                # Progress update for very large directories
-                if len(image_files) % 5000 == 0:
-                    print(f"Found {len(image_files):,} image files...")
+        # Use more efficient scanning
+        try:
+            # Try to use os.walk for better performance on large directories
+            for root, dirs, files in os.walk(folder):
+                for file in files:
+                    if any(file.lower().endswith(ext) for ext in self.supported_formats):
+                        image_files.append(Path(root) / file)
+                        
+                        if len(image_files) % 10000 == 0:
+                            print(f"Found {len(image_files):,} image files...")
+        except:
+            # Fallback to rglob if os.walk fails
+            for file_path in folder.rglob('*'):
+                if file_path.is_file() and file_path.suffix.lower() in self.supported_formats:
+                    image_files.append(file_path)
         
         elapsed = time.time() - start_time
         print(f"Scan completed: {len(image_files):,} image files found in {elapsed:.1f}s")
@@ -276,7 +290,7 @@ class ImageFilter:
     def filter_images(self, folder_path: str, output_folder: str = None, 
                      move_filtered: bool = False, progress_callback=None) -> List[str]:
         """
-        Main filtering method - optimized for large datasets.
+        Main filtering method - ultra-optimized for large datasets.
         """
         start_time = time.time()
         
@@ -286,8 +300,8 @@ class ImageFilter:
             print(message)
         
         # Get all image files
-        log("Starting optimized image filtering...")
-        image_files = self.get_image_files(folder_path)
+        log("Starting ultra-fast image filtering...")
+        image_files = self.get_image_files_fast(folder_path)
         
         if not image_files:
             log("No image files found!")
@@ -296,11 +310,10 @@ class ImageFilter:
         log(f"Processing {len(image_files):,} images with {self.max_workers} workers...")
         
         # Process all images
-        results = self.process_images_optimized(image_files, progress_callback)
+        results = self.process_images_ultra_fast(image_files, progress_callback)
         
-        # Find duplicate groups
-        log("Finding duplicate groups...")
-        duplicate_groups = self._find_duplicates_efficient(results['valid_hashes'])
+        # Find duplicate groups with optimized algorithm
+        duplicate_groups = self._find_duplicates_ultra_fast(results['valid_hashes'])
         
         # Collect filtered images (keep first in each group)
         filtered_images = set(results['solid_color'] + results['resolution_filtered'])
@@ -319,6 +332,7 @@ class ImageFilter:
         
         # Final summary
         elapsed = time.time() - start_time
+        rate = len(image_files) / elapsed if elapsed > 0 else 0
         log(f"\n{'='*60}")
         log(f"FILTERING COMPLETE")
         log(f"{'='*60}")
@@ -330,19 +344,20 @@ class ImageFilter:
         log(f"Duplicates removed: {total_duplicates:,}")
         log(f"Total filtered: {len(filtered_images):,}")
         log(f"Remaining: {len(image_files) - len(filtered_images):,}")
-        log(f"Processing rate: {len(image_files)/elapsed:.1f} images/second")
+        log(f"Processing rate: {rate:.0f} images/second")
         
         return list(filtered_images)
     
     def _move_filtered_images(self, filtered_images: Set[str], output_folder: str, log_func):
-        """Move filtered images to output folder with conflict resolution."""
+        """Move filtered images to output folder with parallel processing."""
         output_path = Path(output_folder)
         output_path.mkdir(exist_ok=True)
         
         log_func(f"Moving {len(filtered_images):,} filtered images...")
         moved_count = 0
+        errors = 0
         
-        for img_path_str in filtered_images:
+        def move_single_file(img_path_str):
             try:
                 img_path = Path(img_path_str)
                 dest_path = output_path / img_path.name
@@ -356,29 +371,39 @@ class ImageFilter:
                     counter += 1
                 
                 img_path.rename(dest_path)
-                moved_count += 1
-                
-                if moved_count % 1000 == 0:
-                    log_func(f"Moved {moved_count:,}/{len(filtered_images):,} files...")
-                    
-            except Exception as e:
-                log_func(f"Error moving {img_path.name}: {e}")
+                return True
+            except Exception:
+                return False
         
-        log_func(f"Successfully moved {moved_count:,} files")
+        # Move files in parallel for better performance
+        with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, self.max_workers)) as executor:
+            futures = [executor.submit(move_single_file, img_path) 
+                      for img_path in filtered_images]
+            
+            for i, future in enumerate(concurrent.futures.as_completed(futures)):
+                if future.result():
+                    moved_count += 1
+                else:
+                    errors += 1
+                
+                if (i + 1) % 1000 == 0:
+                    log_func(f"Moved {moved_count:,}/{len(filtered_images):,} files...")
+        
+        log_func(f"Successfully moved {moved_count:,} files ({errors} errors)")
 
 
 class ImageFilterGUI:
     def __init__(self, root):
         self.root = root
-        self.root.title("Image Filter Tool - High Performance")
+        self.root.title("Image Filter Tool - Ultra Performance")
         self.root.geometry("900x750")
         
-        # Variables with optimized defaults
+        # Variables with optimized defaults for performance
         self.folder_path = tk.StringVar()
         self.output_path = tk.StringVar()
         self.similarity_threshold = tk.DoubleVar(value=0.95)
         self.solid_threshold = tk.DoubleVar(value=0.98)
-        self.max_workers = tk.IntVar(value=min(16, os.cpu_count() or 4))
+        self.max_workers = tk.IntVar(value=min(32, (os.cpu_count() or 1) * 2))
         self.hash_size = tk.IntVar(value=8)  # Optimized for speed
         self.move_files = tk.BooleanVar(value=False)
         self.filter_by_resolution = tk.BooleanVar(value=False)
@@ -403,13 +428,18 @@ class ImageFilterGUI:
         ttk.Button(main_frame, text="Browse", command=self.browse_output_folder).grid(row=1, column=2, padx=5)
         
         # Performance options
-        perf_frame = ttk.LabelFrame(main_frame, text="Performance Settings", padding="10")
+        perf_frame = ttk.LabelFrame(main_frame, text="Performance Settings (Ultra Mode)", padding="10")
         perf_frame.grid(row=2, column=0, columnspan=3, sticky=(tk.W, tk.E), pady=10)
         
         ttk.Label(perf_frame, text="CPU Workers:").grid(row=0, column=0, sticky=tk.W)
-        ttk.Spinbox(perf_frame, from_=1, to=32, textvariable=self.max_workers, width=10).grid(row=0, column=1, sticky=tk.W, padx=5)
+        ttk.Spinbox(perf_frame, from_=1, to=64, textvariable=self.max_workers, width=10).grid(row=0, column=1, sticky=tk.W, padx=5)
         ttk.Label(perf_frame, text="Hash Size:").grid(row=0, column=2, sticky=tk.W, padx=(20,5))
         ttk.Spinbox(perf_frame, from_=4, to=16, textvariable=self.hash_size, width=10).grid(row=0, column=3, padx=5)
+        
+        # Add performance info
+        perf_info = ttk.Label(perf_frame, text=f"Optimized for {os.cpu_count() or 1} CPU cores", 
+                             foreground="blue")
+        perf_info.grid(row=1, column=0, columnspan=4, sticky=tk.W, pady=5)
         
         # Filter options
         filter_frame = ttk.LabelFrame(main_frame, text="Filter Settings", padding="10")
@@ -454,7 +484,7 @@ class ImageFilterGUI:
         button_frame = ttk.Frame(main_frame)
         button_frame.grid(row=7, column=0, columnspan=3, pady=10)
         
-        ttk.Button(button_frame, text="Start Filtering", command=self.start_filtering).pack(side=tk.LEFT, padx=5)
+        ttk.Button(button_frame, text="Start Ultra-Fast Filtering", command=self.start_filtering).pack(side=tk.LEFT, padx=5)
         ttk.Button(button_frame, text="Clear Log", command=self.clear_log).pack(side=tk.LEFT, padx=5)
         
         # Results
@@ -515,7 +545,7 @@ class ImageFilterGUI:
         
         def run_filter():
             try:
-                self.log_message("Starting high-performance image filtering...")
+                self.log_message("Starting ultra-fast image filtering...")
                 filtered = filter_instance.filter_images(
                     self.folder_path.get(),
                     self.output_path.get() if self.move_files.get() else None,
@@ -543,7 +573,7 @@ def main():
         return
     
     # Command line interface
-    parser = argparse.ArgumentParser(description='High-performance image filter for large datasets')
+    parser = argparse.ArgumentParser(description='Ultra-fast image filter for large datasets')
     parser.add_argument('folder', help='Folder containing images to filter')
     parser.add_argument('--output', '-o', help='Output folder for filtered images')
     parser.add_argument('--move', '-m', action='store_true', 
@@ -552,8 +582,8 @@ def main():
                        help='Similarity threshold (0-1, default: 0.95)')
     parser.add_argument('--solid-threshold', '-t', type=float, default=0.98,
                        help='Solid color threshold (0-1, default: 0.98)')
-    parser.add_argument('--workers', '-w', type=int, default=min(16, os.cpu_count() or 4),
-                       help='Number of parallel workers')
+    parser.add_argument('--workers', '-w', type=int, default=None,
+                       help='Number of parallel workers (auto-detected if not specified)')
     parser.add_argument('--hash-size', type=int, default=8,
                        help='Hash size for similarity detection (4-16, default: 8)')
     parser.add_argument('--min-resolution', type=str, 
